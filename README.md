@@ -85,12 +85,12 @@ If you have any questions about this project, please feel free to drop me an ema
 
 NIE Lang -- nielang@bjtu.edu.cn
 ```
-@inproceedings{nie2025eliminating,
+@inproceedings{nie2024eliminating,
   title={Eliminating Warping Shakes for Unsupervised Online Video Stitching},
   author={Nie, Lang and Lin, Chunyu and Liao, Kang and Zhang, Yun and Liu, Shuaicheng and Ai, Rui and Zhao, Yao},
   booktitle={European Conference on Computer Vision},
   pages={390--407},
-  year={2025},
+  year={2024},
   organization={Springer}
 }
 ```
