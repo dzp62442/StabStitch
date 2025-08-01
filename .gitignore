@@ -1,0 +1,16 @@
+Dataset/
+Datasets
+__pycache__/
+*.pth
+*.zip
+*.tar
+ave_fusion/
+learn_mask1/
+learn_mask2
+composition/
+events*
+Datasets
+model/
+results_ssd/
+results_tra/
+*.mp4
