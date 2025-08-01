@@ -1,0 +1,13 @@
+input_img_num: 2
+data_path: /home/B_UserData/dongzhipeng/Datasets/SV-UDIS-D/  # 数据集根路径
+sub_datasets:  # 子数据集名称
+  # - RealTractor5
+  # - RealTractor6
+  - UDIS
+  # - WhiteCar
+net_input_width: 512
+net_input_height: 512
+use_warp: False
+warp_cfg:  # if use_warp == True
+  warp_mode: cylindrical  # cylindrical, spherical
+  scale: 720
