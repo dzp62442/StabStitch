@@ -1,3 +1,19 @@
+环境配置
+```shell
+conda create -n stabstitch python=3.8.5
+conda activate stabstitch
+pip install numpy==1.19.5 torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1 -f https://download.pytorch.org/whl/cu116/torch_stable.html
+pip install setuptools==65.5.1
+pip install -r requirements.txt
+```
+
+进行与 ChatStitch SV-UDIS 的对比实验：
+```bash
+cd Codes
+python test_sv_comp.py
+```
+------
+
 # <p align="center">Eliminating Warping Shakes for Unsupervised Online Video Stitching
 
 ## 🚩Recommendation

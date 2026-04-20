@@ -73,7 +73,11 @@ class MultiWarpDataset(Dataset):
 
 
     def __getitem__(self, index):
-        input_index = [x for x in range(self.input_img_num)]  # 读取的所有图像的序号，[0, self.input_img_num - 1]
+        sub_dataset = self.data_keys[index].split('/')[0]  # 当前数据所属的子数据集
+        if sub_dataset.startswith('RealTractor') and 2 <= self.input_img_num <= 5:
+            input_index = [6, 7, 0, 1, 2][:self.input_img_num]
+        else:
+            input_index = [x for x in range(self.input_img_num)]  # 读取的所有图像的序号，[0, self.input_img_num - 1]
 
         input_imgs, input_masks = [], []
         for i in range(self.input_img_num):
@@ -83,7 +87,6 @@ class MultiWarpDataset(Dataset):
             input_mask = None
             # 对图像进行投影变换
             if (self.use_warp):
-                sub_dataset = self.data_keys[index].split('/')[0]  # 当前数据所属的子数据集
                 if sub_dataset == 'UDIS':  # UDIS数据集不进行投影变换
                     input_mask = self.input_masks[sub_dataset]
                 elif sub_dataset == 'PandaSet':  # PandaSet 数据集包含多种相机内参
