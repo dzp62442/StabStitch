@@ -1,23 +1,40 @@
 # coding: utf-8
 import argparse
-import torch
-from torch.utils.data import DataLoader
-import torch.nn as nn
-import imageio
-from spatial_network import build_SpatialNet, SpatialNet
-from temporal_network import build_TemporalNet, TemporalNet
-from smooth_network import build_SmoothNet, SmoothNet
-import os
-import numpy as np
-import skimage
-import cv2
-import utils.torch_tps_transform as torch_tps_transform
-import utils.torch_tps_transform_point as torch_tps_transform_point
-from PIL import Image
 import glob
+import os
 import time
+
+import cv2
+import numpy as np
+import torch
+import yaml
+from loguru import logger
+from omegaconf import OmegaConf
 from torchvision.transforms import GaussianBlur
 
+from smooth_network import SmoothNet, build_SmoothNet
+from spatial_network import SpatialNet, build_SpatialNet
+from sv_comp.dataset import MultiWarpDataset
+from temporal_network import TemporalNet, build_TemporalNet
+import utils.torch_tps_transform as torch_tps_transform
+import utils.torch_tps_transform_point as torch_tps_transform_point
+
+try:
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+    def compare_psnr(img1, img2, data_range):
+        return peak_signal_noise_ratio(img1, img2, data_range=data_range)
+
+    def compare_ssim(img1, img2, data_range):
+        return structural_similarity(img1, img2, data_range=data_range, channel_axis=-1)
+except ImportError:
+    import skimage.measure
+
+    def compare_psnr(img1, img2, data_range):
+        return skimage.measure.compare_psnr(img1, img2, data_range)
+
+    def compare_ssim(img1, img2, data_range):
+        return skimage.measure.compare_ssim(img1, img2, data_range=data_range, multichannel=True)
 
 
 last_path = os.path.abspath(os.path.join(os.path.dirname("__file__"), os.path.pardir))
@@ -26,358 +43,447 @@ MODEL_DIR = os.path.join(last_path, 'model')
 grid_h = 6
 grid_w = 8
 
+
 def linear_blender(ref, tgt, ref_m, tgt_m, mask=False):
-    blur = GaussianBlur(kernel_size=(21,21), sigma=20)
+    blur = GaussianBlur(kernel_size=(21, 21), sigma=20)
+    device = ref.device
+
+    if torch.count_nonzero(ref_m) == 0 or torch.count_nonzero(tgt_m) == 0:
+        if mask:
+            return ref_m.clamp(0, 1)
+        return ref * ref_m + tgt * tgt_m
+
     r1, c1 = torch.nonzero(ref_m[0, 0], as_tuple=True)
     r2, c2 = torch.nonzero(tgt_m[0, 0], as_tuple=True)
-
     center1 = (r1.float().mean(), c1.float().mean())
     center2 = (r2.float().mean(), c2.float().mean())
-
     vec = (center2[0] - center1[0], center2[1] - center1[1])
 
     ovl = (ref_m * tgt_m).round()[:, 0].unsqueeze(1)
     ref_m_ = ref_m[:, 0].unsqueeze(1) - ovl
-    r, c = torch.nonzero(ovl[0, 0], as_tuple=True)
+    if torch.count_nonzero(ovl) == 0:
+        mask1 = blur(ref_m).clamp(0, 1)
+        if mask:
+            return mask1
+        mask2 = (1 - mask1) * tgt_m
+        return ref * mask1 + tgt * mask2
 
-    ovl_mask = torch.zeros_like(ref_m_).cuda()
+    r, c = torch.nonzero(ovl[0, 0], as_tuple=True)
+    ovl_mask = torch.zeros_like(ref_m_, device=device)
     proj_val = (r - center1[0]) * vec[0] + (c - center1[1]) * vec[1]
     ovl_mask[ovl.bool()] = (proj_val - proj_val.min()) / (proj_val.max() - proj_val.min() + 1e-3)
 
-    mask1 = (blur(ref_m_ + (1-ovl_mask)*ref_m[:,0].unsqueeze(1)) * ref_m + ref_m_).clamp(0,1)
-    if mask: return mask1
+    mask1 = (blur(ref_m_ + (1 - ovl_mask) * ref_m[:, 0].unsqueeze(1)) * ref_m + ref_m_).clamp(0, 1)
+    if mask:
+        return mask1
 
-    mask2 = (1-mask1) * tgt_m
-    stit = ref * mask1 + tgt * mask2
-
-    return stit
+    mask2 = (1 - mask1) * tgt_m
+    return ref * mask1 + tgt * mask2
 
 
 def recover_mesh(norm_mesh, height, width):
-    #from [bs, pn, 2] to [bs, grid_h+1, grid_w+1, 2]
-
     batch_size = norm_mesh.size()[0]
-    mesh_w = (norm_mesh[...,0]+1) * float(width) / 2.
-    mesh_h = (norm_mesh[...,1]+1) * float(height) / 2.
-    mesh = torch.stack([mesh_w, mesh_h], 2) # [bs,(grid_h+1)*(grid_w+1),2]
-
-    return mesh.reshape([batch_size, grid_h+1, grid_w+1, 2])
-
-def get_rigid_mesh(batch_size, height, width):
+    mesh_w = (norm_mesh[..., 0] + 1) * float(width) / 2.0
+    mesh_h = (norm_mesh[..., 1] + 1) * float(height) / 2.0
+    mesh = torch.stack([mesh_w, mesh_h], 2)
+    return mesh.reshape([batch_size, grid_h + 1, grid_w + 1, 2])
 
 
-    ww = torch.matmul(torch.ones([grid_h+1, 1]), torch.unsqueeze(torch.linspace(0., float(width), grid_w+1), 0))
-    hh = torch.matmul(torch.unsqueeze(torch.linspace(0.0, float(height), grid_h+1), 1), torch.ones([1, grid_w+1]))
-    if torch.cuda.is_available():
-        ww = ww.cuda()
-        hh = hh.cuda()
+def get_rigid_mesh(batch_size, height, width, device):
+    ww = torch.matmul(
+        torch.ones([grid_h + 1, 1], device=device),
+        torch.unsqueeze(torch.linspace(0.0, float(width), grid_w + 1, device=device), 0),
+    )
+    hh = torch.matmul(
+        torch.unsqueeze(torch.linspace(0.0, float(height), grid_h + 1, device=device), 1),
+        torch.ones([1, grid_w + 1], device=device),
+    )
+    ori_pt = torch.cat((ww.unsqueeze(2), hh.unsqueeze(2)), 2)
+    return ori_pt.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-    ori_pt = torch.cat((ww.unsqueeze(2), hh.unsqueeze(2)),2) # (grid_h+1)*(grid_w+1)*2
-    ori_pt = ori_pt.unsqueeze(0).expand(batch_size, -1, -1, -1)
-
-    return ori_pt
 
 def get_norm_mesh(mesh, height, width):
     batch_size = mesh.size()[0]
-    mesh_w = mesh[...,0]*2./float(width) - 1.
-    mesh_h = mesh[...,1]*2./float(height) - 1.
-    norm_mesh = torch.stack([mesh_w, mesh_h], 3) # bs*(grid_h+1)*(grid_w+1)*2
+    mesh_w = mesh[..., 0] * 2.0 / float(width) - 1.0
+    mesh_h = mesh[..., 1] * 2.0 / float(height) - 1.0
+    norm_mesh = torch.stack([mesh_w, mesh_h], 3)
+    return norm_mesh.reshape([batch_size, -1, 2])
 
-    return norm_mesh.reshape([batch_size, -1, 2]) # bs*-1*2
 
-
-# bs, T, h, w, 2  smooth_path
-def get_stable_sqe(img1_list, img2_list, ori_mesh):
+def get_stable_sqe(img1_list, img2_list, ori_mesh, warp_mode='FAST', fusion_mode='AVERAGE'):
+    device = ori_mesh.device
     batch_size, _, img_h, img_w = img2_list[0].shape
 
-    rigid_mesh = get_rigid_mesh(batch_size, img_h, img_w)
+    # The network predicts meshes on 360x480 inputs. Convert them to the
+    # current image resolution before warping full-resolution images.
+    mesh = torch.stack([ori_mesh[..., 0] * img_w / 480.0, ori_mesh[..., 1] * img_h / 360.0], 4)
+
+    rigid_mesh = get_rigid_mesh(batch_size, img_h, img_w, device)
     norm_rigid_mesh = get_norm_mesh(rigid_mesh, img_h, img_w)
 
-    width_max = torch.max(ori_mesh[...,0])
-    width_max = torch.maximum(torch.tensor(img_w).cuda(), width_max)
-    width_min = torch.min(ori_mesh[...,0])
-    width_min = torch.minimum(torch.tensor(0).cuda(), width_min)
-    height_max = torch.max(ori_mesh[...,1])
-    height_max = torch.maximum(torch.tensor(img_h).cuda(), height_max)
-    height_min = torch.min(ori_mesh[...,1])
-    height_min = torch.minimum(torch.tensor(0).cuda(), height_min)
+    width_max = torch.maximum(torch.tensor(float(img_w), device=device), torch.max(mesh[..., 0]))
+    width_min = torch.minimum(torch.tensor(0.0, device=device), torch.min(mesh[..., 0]))
+    height_max = torch.maximum(torch.tensor(float(img_h), device=device), torch.max(mesh[..., 1]))
+    height_min = torch.minimum(torch.tensor(0.0, device=device), torch.min(mesh[..., 1]))
 
-    width_min = width_min.int()
-    width_max = width_max.int()
-    height_min = height_min.int()
-    height_max = height_max.int()
-    out_width = width_max - width_min+1
-    out_height = height_max - height_min+1
-
-    print(out_width)
-    print(out_height)
-
-    img1_warp = torch.zeros((1, 3, out_height, out_width)).cuda()
+    width_min_int = int(torch.floor(width_min).item())
+    width_max_int = int(torch.ceil(width_max).item())
+    height_min_int = int(torch.floor(height_min).item())
+    height_max_int = int(torch.ceil(height_max).item())
+    out_width = width_max_int - width_min_int + 1
+    out_height = height_max_int - height_min_int + 1
 
     stable_list = []
-    mesh_tran_list = []
     for i in range(len(img2_list)):
-        mesh = ori_mesh[:,i,:,:,:]
-        mesh_trans = torch.stack([mesh[...,0]-width_min, mesh[...,1]-height_min], 3)
+        mesh_frame = mesh[:, i, :, :, :]
+        mesh_trans = torch.stack([mesh_frame[..., 0] - width_min_int, mesh_frame[..., 1] - height_min_int], 3)
         norm_mesh = get_norm_mesh(mesh_trans, out_height, out_width)
-        img2 = (img2_list[i].cuda()+1)*127.5
 
-        # mode = 'FAST': use F.grid_sample to interpolate. It's fast, but may produce thin black boundary.
-        # mode = 'NORMAL': use our implemented interpolation function. It's a bit slower, but avoid the black boundary.
-        img2_warp = torch_tps_transform.transformer(img2, norm_mesh, norm_rigid_mesh, (out_height, out_width), mode = 'FAST')
+        img1 = (img1_list[i].to(device) + 1) * 127.5
+        img2 = (img2_list[i].to(device) + 1) * 127.5
+        img1_warp = torch.zeros((1, 3, out_height, out_width), device=device)
+        img1_warp[:, :, -height_min_int:-height_min_int + img_h, -width_min_int:-width_min_int + img_w] = img1
 
-        # average blending
-        img1_warp[:,:,int(0-height_min):int(0-height_min)+360, int(0-width_min):int(0-width_min)+480] = (img1_list[i].cuda() + 1) * 127.5
+        img2_warp = torch_tps_transform.transformer(img2, norm_mesh, norm_rigid_mesh, (out_height, out_width), mode=warp_mode)
+        if fusion_mode == 'LINEAR':
+            mask1 = torch.zeros((1, 1, out_height, out_width), device=device)
+            mask1[:, :, -height_min_int:-height_min_int + img_h, -width_min_int:-width_min_int + img_w] = 1
+            mask2 = torch_tps_transform.transformer(
+                torch.ones_like(img2[:, :1, ...], device=device), norm_mesh, norm_rigid_mesh, (out_height, out_width), mode=warp_mode
+            )
+            fusion = linear_blender(img1_warp, img2_warp, mask1, mask2)[0]
+        else:
+            fusion = img1_warp[0] * (img1_warp[0] / (img1_warp[0] + img2_warp[0] + 1e-6))
+            fusion += img2_warp[0] * (img2_warp[0] / (img1_warp[0] + img2_warp[0] + 1e-6))
 
-        ave_fusion = (img1_warp[0] * (img1_warp[0]/ (img1_warp[0]+img2_warp[0]+1e-6)) + img2_warp[0] * (img2_warp[0]/ (img1_warp[0]+img2_warp[0]+1e-6)))
-
-        # # linear blending
-        # img1_warp[:,int(0-height_min):int(0-height_min)+360, int(0-width_min):int(0-width_min)+480] = (img1_list[i][0] + 1) * 127.5
-        # mask1 = img1_warp.clone()
-        # mask1[:,int(0-height_min):int(0-height_min)+360, int(0-width_min):int(0-width_min)+480] = 1
-        # mask2 = torch_tps_transform.transformer(torch.ones_like(img2).cuda(), norm_mesh, norm_rigid_mesh, (out_height, out_width))
-        # ave_fusion = linear_blender(img1_warp.unsqueeze(0), img2_warp, mask1.unsqueeze(0), mask2)
-        # ave_fusion = ave_fusion[0]
-
-        stable_list.append(ave_fusion)
-
+        stable_list.append(fusion.detach().cpu().numpy().transpose(1, 2, 0))
 
     return stable_list, out_width, out_height
 
 
+def get_stable_sqe_metric(img2_list, ori_mesh, warp_mode='NORMAL'):
+    device = ori_mesh.device
+    batch_size, _, img_h, img_w = img2_list[0].shape
 
-def test(args):
+    rigid_mesh = get_rigid_mesh(batch_size, img_h, img_w, device)
+    norm_rigid_mesh = get_norm_mesh(rigid_mesh, img_h, img_w)
 
-    os.environ['CUDA_DEVICES_ORDER'] = "PCI_BUS_ID"
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    stable_list = []
+    for i in range(len(img2_list)):
+        mesh = ori_mesh[:, i, :, :, :]
+        norm_mesh = get_norm_mesh(mesh, img_h, img_w)
+        img2 = (img2_list[i].to(device) + 1) * 127.5
+        mask = torch.ones_like(img2, device=device)
+        img2_warp = torch_tps_transform.transformer(
+            torch.cat([img2, mask], 1), norm_mesh, norm_rigid_mesh, (img_h, img_w), mode=warp_mode
+        )
+        stable_list.append(img2_warp[0].detach().cpu().numpy().transpose(1, 2, 0))
 
-    # define the network
-    spatial_net = SpatialNet()
-    temporal_net = TemporalNet()
-    smooth_net = SmoothNet()
-    if torch.cuda.is_available():
-        spatial_net = spatial_net.cuda()
-        temporal_net = temporal_net.cuda()
-        smooth_net = smooth_net.cuda()
+    return stable_list
 
-    #load the existing models if it exists
-    ckpt_list = glob.glob(MODEL_DIR + "/*.pth")
+
+def image_to_tensor(image, normalize=True):
+    image = image.astype(np.float32)
+    if normalize:
+        image = (image / 127.5) - 1.0
+    image = np.transpose(image, [2, 0, 1])
+    return torch.tensor(image).unsqueeze(0)
+
+
+def resize_image(image, width, height):
+    if image.shape[0] != height or image.shape[1] != width:
+        return cv2.resize(image, (width, height))
+    return image
+
+
+def prepare_stage_inputs(ref_sequence, tgt_image, origin_h, origin_w, net_h, net_w, video_length):
+    ref_hr_tensor_list = []
+    tgt_hr_tensor_list = []
+    ref_tensor_list = []
+    tgt_tensor_list = []
+    ref_metric_list = []
+
+    tgt_origin = resize_image(tgt_image, origin_w, origin_h)
+    tgt_low = resize_image(tgt_origin, net_w, net_h)
+    tgt_hr_tensor = image_to_tensor(tgt_origin, normalize=True)
+    tgt_tensor = image_to_tensor(tgt_low, normalize=True)
+
+    for k in range(video_length):
+        ref_origin = resize_image(ref_sequence[k], origin_w, origin_h)
+        ref_low = resize_image(ref_origin, net_w, net_h)
+
+        ref_hr_tensor_list.append(image_to_tensor(ref_origin, normalize=True))
+        tgt_hr_tensor_list.append(tgt_hr_tensor.clone())
+        ref_tensor_list.append(image_to_tensor(ref_low, normalize=True))
+        tgt_tensor_list.append(tgt_tensor.clone())
+        ref_metric_list.append(ref_low.astype(np.float32))
+
+    return {
+        'ref_hr_tensor_list': ref_hr_tensor_list,
+        'tgt_hr_tensor_list': tgt_hr_tensor_list,
+        'ref_tensor_list': ref_tensor_list,
+        'tgt_tensor_list': tgt_tensor_list,
+        'ref_metric_list': ref_metric_list,
+    }
+
+
+def load_models(device):
+    spatial_net = SpatialNet().to(device)
+    temporal_net = TemporalNet().to(device)
+    smooth_net = SmoothNet().to(device)
+
+    ckpt_list = glob.glob(os.path.join(MODEL_DIR, '*.pth'))
     ckpt_list.sort()
+    if len(ckpt_list) != 3:
+        raise FileNotFoundError(f'Expected 3 checkpoints in {MODEL_DIR}, but found {len(ckpt_list)}')
 
-    if len(ckpt_list) == 3:
-        # load spatial warp model
-        spatial_model_path = MODEL_DIR + "/spatial_warp.pth"
-        spatial_checkpoint = torch.load(spatial_model_path)
-        spatial_net.load_state_dict(spatial_checkpoint['model'])
-        print('load model from {}!'.format(spatial_model_path))
-        # load temporal warp model
-        temporal_model_path = MODEL_DIR + "/temporal_warp.pth"
-        temporal_checkpoint = torch.load(temporal_model_path)
-        temporal_net.load_state_dict(temporal_checkpoint['model'])
-        print('load model from {}!'.format(temporal_model_path))
-        # load smooth warp model
-        smooth_model_path = MODEL_DIR + "/smooth_warp.pth"
-        smooth_checkpoint = torch.load(smooth_model_path)
-        smooth_net.load_state_dict(smooth_checkpoint['model'])
-        print('load model from {}!'.format(smooth_model_path))
-    else:
-        print('No checkpoint found!')
+    spatial_model_path = os.path.join(MODEL_DIR, 'spatial_warp.pth')
+    temporal_model_path = os.path.join(MODEL_DIR, 'temporal_warp.pth')
+    smooth_model_path = os.path.join(MODEL_DIR, 'smooth_warp.pth')
 
+    spatial_checkpoint = torch.load(spatial_model_path, map_location='cpu')
+    temporal_checkpoint = torch.load(temporal_model_path, map_location='cpu')
+    smooth_checkpoint = torch.load(smooth_model_path, map_location='cpu')
 
+    spatial_net.load_state_dict(spatial_checkpoint['model'])
+    temporal_net.load_state_dict(temporal_checkpoint['model'])
+    smooth_net.load_state_dict(smooth_checkpoint['model'])
+    logger.info(f'load model from {spatial_model_path}')
+    logger.info(f'load model from {temporal_model_path}')
+    logger.info(f'load model from {smooth_model_path}')
 
     spatial_net.eval()
     temporal_net.eval()
     smooth_net.eval()
-
-    print("##################start testing#######################")
-
-    psnr_list = []
-    ssim_list = []
+    return spatial_net, temporal_net, smooth_net
 
 
-    video_name_list = glob.glob(os.path.join(args.test_path, '*'))
-    video_name_list = sorted(video_name_list)
-    print(video_name_list)
+def summarize_metric(metric_name, metric_list):
+    if not metric_list:
+        logger.warning(f'No valid {metric_name} values were collected.')
+        return
 
-    img_h = 360
-    img_w = 480
+    sorted_metric = sorted(metric_list, reverse=True)
+    total = len(sorted_metric)
+    thirty_percent_index = int(total * 0.3)
+    sixty_percent_index = int(total * 0.6)
 
+    metric_top_30 = sorted_metric[0:thirty_percent_index]
+    metric_top_60 = sorted_metric[thirty_percent_index:sixty_percent_index]
+    metric_top_100 = sorted_metric[sixty_percent_index:]
 
-
-    for i in range(len(video_name_list)):
-        # if i<24:
-        #     continue
-        print()
-        print(i)
-        print(video_name_list[i])
-
-        #define an online buffer (len == 7)
-        buffer_len = 7
-        tmotion_tensor_list = []
-        smotion_tensor_list = []
-        omask_tensor_list = []
-
-        # img name list
-        img1_name_list = glob.glob(os.path.join(video_name_list[i]+ "/video1/", '*.jpg'))
-        img2_name_list = glob.glob(os.path.join(video_name_list[i]+ "/video2/", '*.jpg'))
-        img1_name_list = sorted(img1_name_list)
-        img2_name_list = sorted(img2_name_list)
+    if metric_top_30:
+        logger.info(f'[{metric_name}] top 30%: {np.mean(metric_top_30)}')
+    if metric_top_60:
+        logger.info(f'[{metric_name}] top 30~60%: {np.mean(metric_top_60)}')
+    if metric_top_100:
+        logger.info(f'[{metric_name}] top 60~100%: {np.mean(metric_top_100)}')
+    logger.info(f'[{metric_name}] average: {np.mean(sorted_metric)}')
 
 
-        # prepare folders
-        if not os.path.exists('../result/'):
-            os.makedirs('../result/')
-        video_name = video_name_list[i].split('/')[-1] + ".mp4"
-        media_path = '../result/' + video_name
-        fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
-        fps = 30
+def run_stage(
+    ref_sequence,
+    tgt_image,
+    origin_h,
+    origin_w,
+    device,
+    spatial_net,
+    temporal_net,
+    smooth_net,
+    net_h,
+    net_w,
+    video_length,
+    warp_mode,
+    fusion_mode,
+):
+    sample = prepare_stage_inputs(ref_sequence, tgt_image, origin_h, origin_w, net_h, net_w, video_length)
+    ref_tensor_list = [tensor.to(device) for tensor in sample['ref_tensor_list']]
+    tgt_tensor_list = [tensor.to(device) for tensor in sample['tgt_tensor_list']]
 
-        img1_tensor_list = []
-        img2_tensor_list = []
+    tmotion_tensor_list = []
+    smotion_tensor_list = []
+    omask_tensor_list = []
 
-        # load imgs
-        for k in range(0, len(img2_name_list)):
-            img1 = cv2.imread(img1_name_list[k])
-            img1 = cv2.resize(img1, (img_w, img_h))
-            img1 = img1.astype(dtype=np.float32)
-            img1 = np.transpose(img1, [2, 0, 1])
-            img1 = (img1 / 127.5) - 1.0
-            img1_tensor = torch.tensor(img1).unsqueeze(0)#.cuda()
-            img1_tensor_list.append(img1_tensor)
-
-            img2 = cv2.imread(img2_name_list[k])
-            img2 = cv2.resize(img2, (img_w, img_h))
-            img2 = img2.astype(dtype=np.float32)
-            img2 = np.transpose(img2, [2, 0, 1])
-            img2 = (img2 / 127.5) - 1.0
-            img2_tensor = torch.tensor(img2).unsqueeze(0)#.cuda()
-            img2_tensor_list.append(img2_tensor)
-
-
-
-        start_time1 = time.time()
-        NOF = len(img2_name_list)
-        # motion estimation
-        for k in range(0, len(img2_name_list)):
-
-            # step 1: spatial warp
-            with torch.no_grad():
-                spatial_batch_out = build_SpatialNet(spatial_net, img1_tensor_list[k].cuda(), img2_tensor_list[k].cuda())
-            smotion = spatial_batch_out['motion']
-            omask = spatial_batch_out['overlap_mesh']
-
-            smotion_tensor_list.append(smotion)
-            omask_tensor_list.append(omask)
-
-
-        # step 2: temporal warp
+    start_time = time.time()
+    for k in range(video_length):
         with torch.no_grad():
-            temporal_batch_out = build_TemporalNet(temporal_net, img2_tensor_list)
-        tmotion_tensor_list = temporal_batch_out['motion_list']
+            spatial_batch_out = build_SpatialNet(spatial_net, ref_tensor_list[k], tgt_tensor_list[k])
+        smotion_tensor_list.append(spatial_batch_out['motion'])
+        omask_tensor_list.append(spatial_batch_out['overlap_mesh'])
+
+    with torch.no_grad():
+        temporal_batch_out = build_TemporalNet(temporal_net, tgt_tensor_list)
+    tmotion_tensor_list = temporal_batch_out['motion_list']
+    logger.info(f'fps (spatial & temporal warp): {video_length / max(time.time() - start_time, 1e-6):.4f}')
+
+    rigid_mesh = get_rigid_mesh(1, net_h, net_w, device)
+    norm_rigid_mesh = get_norm_mesh(rigid_mesh, net_h, net_w)
+    smesh_list = []
+    tsmotion_list = []
+    for k in range(len(tmotion_tensor_list)):
+        smotion = smotion_tensor_list[k]
+        smesh = rigid_mesh + smotion
+        if k == 0:
+            tsmotion = smotion.clone() * 0
+        else:
+            smotion_prev = smotion_tensor_list[k - 1]
+            smesh_prev = rigid_mesh + smotion_prev
+            tmotion = tmotion_tensor_list[k]
+            tmesh = rigid_mesh + tmotion
+            norm_smesh_prev = get_norm_mesh(smesh_prev, net_h, net_w)
+            norm_tmesh = get_norm_mesh(tmesh, net_h, net_w)
+            tsmesh = torch_tps_transform_point.transformer(norm_tmesh, norm_rigid_mesh, norm_smesh_prev)
+            tsmotion = recover_mesh(tsmesh, net_h, net_w) - smesh
+        smesh_list.append(smesh)
+        tsmotion_list.append(tsmotion)
+
+    ori_mesh = None
+    target_mesh = None
+    for k in range(len(tmotion_tensor_list) - 6):
+        tsmotion_sublist = list(tsmotion_list[k:k + 7])
+        tsmotion_sublist[0] = smotion_tensor_list[k] * 0
+
+        with torch.no_grad():
+            smooth_batch_out = build_SmoothNet(smooth_net, tsmotion_sublist, smesh_list[k:k + 7], omask_tensor_list[k:k + 7])
+
+        current_ori_mesh = smooth_batch_out['ori_mesh']
+        current_target_mesh = smooth_batch_out['target_mesh']
+        if k == 0:
+            ori_mesh = current_ori_mesh
+            target_mesh = current_target_mesh
+        else:
+            ori_mesh = torch.cat((ori_mesh, current_ori_mesh[:, -1, ...].unsqueeze(1)), 1)
+            target_mesh = torch.cat((target_mesh, current_target_mesh[:, -1, ...].unsqueeze(1)), 1)
+
+    logger.info(f'fps (smooth warp): {video_length / max(time.time() - start_time, 1e-6):.4f}')
+
+    stable_list, out_width, out_height = get_stable_sqe(
+        sample['ref_hr_tensor_list'],
+        sample['tgt_hr_tensor_list'],
+        target_mesh,
+        warp_mode=warp_mode,
+        fusion_mode=fusion_mode,
+    )
+    logger.info(f'fps (warping & blending): {video_length / max(time.time() - start_time, 1e-6):.4f}')
+
+    stable_metric_list = get_stable_sqe_metric(sample['tgt_tensor_list'], target_mesh, warp_mode='NORMAL')
+    pair_psnr_list = []
+    pair_ssim_list = []
+    for k in range(video_length):
+        ref_img = sample['ref_metric_list'][k]
+        img2_warp = stable_metric_list[k][..., 0:3]
+        img2_warp_mask = stable_metric_list[k][..., 3:6]
+        pair_psnr_list.append(compare_psnr(ref_img * img2_warp_mask, img2_warp * img2_warp_mask, 255))
+        pair_ssim_list.append(compare_ssim(ref_img * img2_warp_mask, img2_warp * img2_warp_mask, 255))
+
+    return {
+        'stable_list': stable_list,
+        'out_width': out_width,
+        'out_height': out_height,
+        'pair_psnr_list': pair_psnr_list,
+        'pair_ssim_list': pair_ssim_list,
+        'pair_psnr_avg': float(np.mean(pair_psnr_list)),
+        'pair_ssim_avg': float(np.mean(pair_ssim_list)),
+        'ori_mesh': ori_mesh,
+        'target_mesh': target_mesh,
+    }
 
 
-        print("fps (spatial & temporal warp):")
-        print(NOF/(time.time() - start_time1))
+def test(args):
+    os.environ['CUDA_DEVICES_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
+    if not torch.cuda.is_available():
+        raise RuntimeError('Current StabStitch sv_comp inference requires CUDA. Please run it on a GPU machine.')
+    if args.video_length < 7:
+        raise ValueError('--video_length must be at least 7 for the smooth warp buffer.')
 
-        ##############################################
-        #############   data preparation  ############
-        # converting tmotion (t-th frame) into tsmotion ( (t-1)-th frame )
-        rigid_mesh = get_rigid_mesh(1, img_h, img_w)
-        norm_rigid_mesh = get_norm_mesh(rigid_mesh, img_h, img_w)
-        smesh_list = []
-        tsmotion_list = []
-        for k in range(len(tmotion_tensor_list)):
-            smotion = smotion_tensor_list[k]
-            smesh = rigid_mesh + smotion
-            if k == 0:
-                tsmotion = smotion.clone() * 0
+    device = torch.device('cuda')
+    sv_comp_cfg = OmegaConf.load('sv_comp/sv_comp.yaml')
+    with open('sv_comp/intrinsics.yaml', 'r', encoding='utf-8') as file:
+        intrinsics = yaml.safe_load(file)
+    dataset = MultiWarpDataset(config=sv_comp_cfg, intrinsics=intrinsics, is_train=False)
+    if len(dataset) == 0:
+        logger.warning('No samples were found under the current sv_comp configuration.')
+        return
 
+    spatial_net, temporal_net, smooth_net = load_models(device)
+    logger.info('##################start testing#######################')
+
+    sample_psnr_list = []
+    sample_ssim_list = []
+    net_h = 360
+    net_w = 480
+
+    for idx in range(len(dataset)):
+        input_imgs, _ = dataset[idx]
+        origin_h, origin_w = input_imgs[0].shape[0], input_imgs[0].shape[1]
+        sample_path = dataset.get_path(idx)
+        result_path = os.path.join(sample_path, args.output_dir_name)
+        os.makedirs(result_path, exist_ok=True)
+
+        logger.info(f'---------------{idx}---------------')
+        logger.info(sample_path)
+
+        middle_stitch_results = None
+        batch_psnr_list = []
+        batch_ssim_list = []
+        for stage_idx in range(sv_comp_cfg.input_img_num - 1):
+            if stage_idx == 0:
+                ref_sequence = [input_imgs[stage_idx]] * args.video_length
             else:
-                smotion_1 = smotion_tensor_list[k-1]
-                smesh_1 = rigid_mesh + smotion_1
-                tmotion = tmotion_tensor_list[k]
-                tmesh = rigid_mesh + tmotion
-                norm_smesh_1 = get_norm_mesh(smesh_1, img_h, img_w)
-                norm_tmesh = get_norm_mesh(tmesh, img_h, img_w)
-                tsmesh = torch_tps_transform_point.transformer(norm_tmesh, norm_rigid_mesh, norm_smesh_1)
-                tsmotion = recover_mesh(tsmesh, img_h, img_w) - smesh
-            # append
-            smesh_list.append(smesh)
-            tsmotion_list.append(tsmotion)
+                ref_sequence = middle_stitch_results
+            tgt_image = input_imgs[stage_idx + 1]
+
+            stage_output = run_stage(
+                ref_sequence=ref_sequence,
+                tgt_image=tgt_image,
+                origin_h=origin_h,
+                origin_w=origin_w,
+                device=device,
+                spatial_net=spatial_net,
+                temporal_net=temporal_net,
+                smooth_net=smooth_net,
+                net_h=net_h,
+                net_w=net_w,
+                video_length=args.video_length,
+                warp_mode=args.warp_mode,
+                fusion_mode=args.fusion_mode,
+            )
+
+            middle_stitch_results = stage_output['stable_list']
+            batch_psnr_list.append(stage_output['pair_psnr_avg'])
+            batch_ssim_list.append(stage_output['pair_ssim_avg'])
+
+            output_name = f'{sv_comp_cfg.input_img_num}_{stage_idx + 2}.jpg'
+            output_img = np.clip(middle_stitch_results[args.video_length // 2], 0, 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(result_path, output_name), output_img)
+            logger.info(f"pair_psnr_list: {stage_output['pair_psnr_list']}, pair_psnr_avg: {stage_output['pair_psnr_avg']}")
+            logger.info(f"pair_ssim_list: {stage_output['pair_ssim_list']}, pair_ssim_avg: {stage_output['pair_ssim_avg']}")
+
+        batch_psnr_avg = float(np.mean(batch_psnr_list))
+        batch_ssim_avg = float(np.mean(batch_ssim_list))
+        logger.info(f'batch_psnr_list: {batch_psnr_list}, batch_psnr_avg: {batch_psnr_avg}')
+        logger.info(f'batch_ssim_list: {batch_ssim_list}, batch_ssim_avg: {batch_ssim_avg}')
+        sample_psnr_list.append(batch_psnr_avg)
+        sample_ssim_list.append(batch_ssim_avg)
+
+    logger.info('<==================== Analysis ===================>')
+    logger.info(f'Total num: {len(dataset)}')
+    summarize_metric('psnr', sample_psnr_list)
+    summarize_metric('ssim', sample_ssim_list)
+    logger.info('##################end testing#######################')
 
 
-        # step 3: smooth warp
-        ori_mesh = 0
-        target_mesh = 0
-
-
-        for k in range(len(tmotion_tensor_list)-6):
-            # get sublist and set the first element to 0
-            tsmotion_sublist = tsmotion_list[k:k+7]
-            tsmotion_sublist[0] = smotion_tensor_list[k] * 0
-
-
-            with torch.no_grad():
-                smooth_batch_out = build_SmoothNet(smooth_net, tsmotion_sublist, smesh_list[k:k+7], omask_tensor_list[k:k+7])
-
-            _ori_mesh = smooth_batch_out["ori_mesh"]
-            _target_mesh = smooth_batch_out["target_mesh"]
-
-
-            if k == 0:
-                ori_mesh = _ori_mesh
-                target_mesh = _target_mesh
-
-            else:
-                ori_mesh = torch.cat((ori_mesh, _ori_mesh[:,-1,...].unsqueeze(1)), 1)
-                target_mesh = torch.cat((target_mesh, _target_mesh[:,-1,...].unsqueeze(1)), 1)
-
-
-
-
-        print("fps (smooth warp):")
-        print(NOF/(time.time() - start_time1))
-
-        # # warp with the original mesh
-        # stable_list, out_width, out_height = get_stable_sqe(img1_tensor_list, img2_tensor_list, ori_mesh)
-        # warp with the target mesh
-        stable_list, out_width, out_height = get_stable_sqe(img1_tensor_list, img2_tensor_list, target_mesh)
-
-
-        print("fps (warping & average blending):")
-        print(NOF/(time.time() - start_time1))
-
-
-
-        media_writer = cv2.VideoWriter(media_path, fourcc, fps, (out_width, out_height))
-
-        for k in range(len(stable_list)):
-
-            ave_fusion = stable_list[k].cpu().numpy().transpose(1,2,0)
-            media_writer.write(ave_fusion.astype(np.uint8 ))
-
-        media_writer.release()
-
-
-
-
-
-    print("##################end testing#######################")
-
-
-if __name__=="__main__":
-
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument('--gpu', type=str, default='0')
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--test_path', type=str, default='/home/B_UserData/dongzhipeng/Datasets/StabStitch-D/testing/')
-    #parser.add_argument('--test_path', type=str, default='/opt/data/Tra-Dataset2/')
-
+    parser.add_argument('--video_length', type=int, default=8)
+    parser.add_argument('--output_dir_name', type=str, default='stabstitch')
+    parser.add_argument('--warp_mode', type=str, default='FAST')
+    parser.add_argument('--fusion_mode', type=str, default='AVERAGE')
 
     print('<==================== Loading data ===================>\n')
-
     args = parser.parse_args()
     print(args)
     test(args)
